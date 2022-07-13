@@ -1,15 +1,26 @@
 import json
 import re
 import time
+from datetime import datetime, timedelta
+from random import choice
+from threading import Thread
 
+import schedule
 import telebot
 from telebot.types import (InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, ReplyKeyboardMarkup)
 
 import export_getcource_users_db
+import google_doc_api
 import in_out_db
 from data import texts
-import google_doc_api
+
+
+# дата время для логов
+def log_datetime():
+    log_datetime = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    return log_datetime
+
 
 with open('data/settings.json') as j:
     settings = json.load(j)
@@ -17,6 +28,7 @@ TOKEN = settings['token']
 key_api = settings['key_api_getcource']
 ID_GROUP_MENTORS = settings['id_group_mentors']
 ID_GROUP_TECHSUPPORT = settings['id_group_techsupport']
+ID_GROUP_PAY = settings['id_group_pay']
 
 telebot.apihelper.SESSION_TIME_TO_LIVE = 5 * 60
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
@@ -44,13 +56,6 @@ def step_keyboard(text_list: list, row_width=2):
     keyboard = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True, row_width=row_width)
     keyboard.add(*text_list)
     return keyboard
-
-# def step_keyboard(text_list):
-#     keyboard = InlineKeyboardMarkup(row_width=2)
-#     for num, text in enumerate(text_list):
-#         btn = InlineKeyboardButton(text=text, callback_data = f'{text}:{num}')
-#         keyboard.add(btn)
-#     return keyboard
 
 
 def url_buttons(array: dict):
@@ -101,7 +106,7 @@ def get_phone(message):
     '''Первый вход. Запросим и получим номер телефона, сверим его в БД'''
     if message.contact is not None:
         telegram_id = message.contact.user_id
-        phone = message.contact.phone_number.replace('+', '')
+        phone = message.contact.phone_number
         if in_out_db.new_users_phone(telegram_id, phone):
             bot.send_message(telegram_id, 'Отлично! Ваш аккаунт telegram связан с аккаунтом getcource')
             questioning(message)
@@ -119,11 +124,12 @@ def get_phone(message):
 def questioning(message):
     telegram_id = message.from_user.id
     text = message.text
-    if 'Назад' in text or text == '/start':
+    msg = bot.send_message(telegram_id, texts.choose_level,
+                           reply_markup=step_keyboard(texts.levels))
+    bot.register_next_step_handler(msg, level_step)
+    if text in ('/start', 'Назад') :
         send_start(message)
         return
-    msg = bot.send_message(telegram_id, texts.choose_level, reply_markup=step_keyboard(texts.levels))
-    bot.register_next_step_handler(msg, level_step)
 
 
 def level_step(message):
@@ -219,7 +225,7 @@ def write_time_reminder(message, *step_triger):
     if 'Назад' in text and step_triger:
         msg = bot.send_message(telegram_id, 'Сколько времени в день вы готовы уделять?', reply_markup=step_keyboard(texts.time_inteval))
         bot.register_next_step_handler(msg, time_step)
-    elif text == '/start' or 'Назад' in text:
+    elif text == '/start' or text == texts.cancel_reminder[1]:
         send_start(message)
         return
     elif text == texts.cancel_reminder[0]:
@@ -234,8 +240,8 @@ def write_time_reminder(message, *step_triger):
         elif in_out_db.update_one_variable_db(telegram_id, 'reminder_start_lessons', text):
             bot.send_message(telegram_id,
                              f'''🟢 Буду напоминать о занятиях в <b>{text}</b>. Вы можете изменить время напоминания нажав внизу кнопку <b>Напоминания</b>''')
-            msg = bot.send_message(telegram_id, '''Выберите свой часовой пояс''',
-                             reply_markup=step_keyboard([str(x) for x in range(-10, 11)], 5))
+            msg = bot.send_message(telegram_id, '''Выберите свой часовой пояс относительно Москвы''',
+                             reply_markup=step_keyboard([f'{v}: {k}' for k,v in texts.utc_time.items()], 3))
             if step_triger:
                 bot.register_next_step_handler(msg, time_utc, True)
             else:
@@ -248,8 +254,11 @@ def time_utc(message, *step_triger):
     '''Запросим часовой пояс и добавим в БД'''
     telegram_id = message.from_user.id
     text = message.text
-    send_start(message, f'🕒 Выбран часовой пояс: <b>{text}</b>')
-    in_out_db.update_one_variable_db(telegram_id, 'utc', text)
+    if text == '/start':
+        send_start(message)
+        return
+    send_start(message, f'🕒 Выбран часовой пояс относительно Москвы: <b>{text}</b>')    
+    in_out_db.update_one_variable_db(telegram_id, 'utc', text.split(':')[1])
     if step_triger:
         block_intro(message)
 
@@ -266,12 +275,12 @@ def block_intro(message):
                      'По кнопке <b>Вводная информация</b> всегда можно получить ссылки на 5 вводных лекций')
 
 
-@bot.message_handler(regexp='Задать вопрос')
+@bot.message_handler(regexp='Задать вопрос', content_types=['audio', 'photo', 'voice', 'video', 'document',
+                'text', 'location', 'contact', 'sticker'])
 def ask_question(message):
     '''Задать вопрос и перенаправить его в чат менеджерам'''
     telegram_id = message.from_user.id
-    msg = bot.send_message(telegram_id,
-                           'Напишите свой вопрос для техподдержки (к сообщению можете прикрепить любое вложение (фото, видео и т.д)), мы ответим в этом чате')
+    msg = bot.send_message(telegram_id, texts.ask_question_manager)
     bot.register_next_step_handler(msg, forward_question)
 
 
@@ -290,15 +299,17 @@ def forward_question(message):
 
 def match_chat_id(message):
     '''Проверка из какого чата слушать сообщения, для фильтрации'''
-    if message.chat.id == ID_GROUP_TECHSUPPORT:
-        return True
+    if message.chat.id in (ID_GROUP_TECHSUPPORT, ID_GROUP_MENTORS, ID_GROUP_PAY):
+        return message.chat.id
 
 
-@bot.message_handler(func=match_chat_id, content_types=['audio', 'photo', 'voice', 'video', 'document', 'text', 'location', 'contact', 'sticker'])
+@bot.message_handler(func=match_chat_id, content_types=['audio', 'photo', 'voice', 'video', 'document',
+                                                        'text', 'location', 'contact', 'sticker'])
 def answer_mentor(message):
     '''Ответ ментора пользователю'''
-    if message.chat.id == ID_GROUP_TECHSUPPORT and message.reply_to_message:
-        bot.forward_message(message.json['reply_to_message']['forward_from']['id'], ID_GROUP_TECHSUPPORT, message.id)
+    chat_id = match_chat_id(message)
+    if chat_id in (ID_GROUP_TECHSUPPORT, ID_GROUP_MENTORS) and message.reply_to_message:
+        bot.forward_message(message.json['reply_to_message']['forward_from']['id'], chat_id, message.id)
         # bot.send_message(message.json['reply_to_message']['forward_from']['id'], f'Ответ ментора: {message.text}')
 
 
@@ -343,18 +354,19 @@ def step_testing(message):
     telegram_id = message.from_user.id
     text = message.text
     if text == 'Cамостоятельно':
+        img = open('data/pic/testing.png', 'rb')
+        bot.send_photo(telegram_id, img)
         msg = bot.send_message(telegram_id, texts.levels_descriptions,
                            reply_markup=step_keyboard(list(texts.dict_levels.keys())))
         bot.register_next_step_handler(msg, step_testing_self)
     elif text == 'C помощью ментора школы':
-        img = open('data/pic/testing.png', 'rb')
-        bot.send_photo(telegram_id, img)
         msg = bot.send_message(telegram_id, texts.levels_descriptions,
                            reply_markup=step_keyboard(['Приступить к тестированию', 'Назад']))
         bot.register_next_step_handler(msg, step_testing_mentor)
 
 
 def step_testing_self(message):
+    '''Самостоятельное тестирование, запишем уровень(level) в БД'''
     telegram_id = message.from_user.id
     text = message.text
     # if not validate_step_message(message, dict(texts.dict_levels.keys())):
@@ -366,6 +378,7 @@ def step_testing_self(message):
 
 
 def step_testing_mentor(message):
+    '''Тестирование с помощью ментора'''
     telegram_id = message.from_user.id
     text = message.text
     if text in ('/start', 'Назад', 'Отмена тестирования'):
@@ -377,6 +390,7 @@ def step_testing_mentor(message):
 
 
 def send_video_mentor(message, count):
+    '''Повторим цикл 5 раз для приема 5 видео и отправим ментору в чат'''
     telegram_id = message.from_user.id
     text = message.text
     print('send_video_mentor', count)
@@ -407,19 +421,62 @@ def send_video_mentor(message, count):
         bot.register_next_step_handler(msg, send_video_mentor, count)
 
 
-# @bot.message_handler(content_types=['text'])
-# def echo_main_menu(message):
-#     text = message.text
-#     print(message)
-    # for menu, command in dic_key_func.items():
-    #     if menu == text:
-    #         print(menu, text)
-    # if text == 'Анкетирование':
-    #     questioning(message)
+def reminder_every_day():
+    id_to_reminder = in_out_db.get_telegram_id_to_reminder()
+    if id_to_reminder:
+        for id in id_to_reminder:
+            print(f'{log_datetime()} ::{id} - Напоминание')
+            with open('logs/send_reminder.log', 'a') as log:
+                log.write(f'{log_datetime()} ::{id} - Напоминание')
+            bot.send_message(id, choice(texts.motivation))
+            bot.send_message(id, 'Вместо этого текста будет ссылка на занятие недели')
+            time.sleep(1)
+
+
+def reminder_every_week():
+    '''Уведомление об уроках на неделю если не установлено напоминание'''
+    id_not_set = in_out_db.get_id_not_set_reminder()
+    for id in id_not_set:
+        bot.send_message(id, f'Оповещение по понедельникам для тех кто не поставил напоминание: {choice(texts.motivation)}')
+        time.sleep(0.2)
+
+
+def read_date_end_subscription():
+    '''Уведомление об окончании подписки за 3 дня'''
+    date_reminder = in_out_db.read_date_end_users_db()
+    date_now = datetime.now().date()
+    for date in date_reminder:
+        print(date)
+        telegram_id = date[0]
+        reminder = date[1]
+        date_end = datetime.strptime(reminder, '%Y-%m-%d').date() - timedelta(days=3)
+        if date_end == date_now:
+            bot.send_message(telegram_id, f'''До окончания Клубной подписки осталось 3 дня. Для продления пожалуйста перейдите по ссылке''',
+                                            reply_markup=url_buttons({'Продлить подписку': 'https://*****'}))
+            time.sleep(0.2)
+
+
+def do_schedule():
+    '''Планировщик в бесконечном потоке'''
+    schedule.every(1).minutes.do(reminder_every_day)
+    # schedule.every().monday.at('09:00').do(reminder_every_week)
+    schedule.every().tuesday.at('09:00').do(reminder_every_week)
+    schedule.every().day.at('09:30').do(read_date_end_subscription)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+
+def main_loop():
+    '''Запустим в разных потоках планировщик и бота'''
+    thread = Thread(target=do_schedule)
+    thread.start()
+
+    bot.infinity_polling()
 
 
 if __name__ == '__main__':
     try:
-        bot.infinity_polling()
-    except:
-        pass
+        main_loop()
+    except Exception as e:
+        print(e)
